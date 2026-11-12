@@ -1,0 +1,7 @@
+# Config locale : IP, utilisateur, chemin de clé -> jamais sur GitHub
+config.conf
+
+# Archives et logs
+*.tar.gz
+*.sql
+*.log
