@@ -25,6 +25,7 @@ flock -n 9 || die "Une sauvegarde ou une restauration est déjà en cours"
 
 WORKDIR="$(mktemp -d)"
 trap 'close_tunnel; rm -rf "$WORKDIR"' EXIT
+vault_init "$WORKDIR"
 open_tunnel
 
 # --- 1. Choix de la sauvegarde -----------------------------------------

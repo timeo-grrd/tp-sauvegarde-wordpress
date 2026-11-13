@@ -49,6 +49,19 @@ load_config() {
     if [[ -n "${DB_NAME:-}" ]]; then
         command -v mysqldump >/dev/null || die "mysqldump introuvable alors que DB_NAME est défini"
     fi
+    KEY_BACKEND="${KEY_BACKEND:-fichier}"
+    case "$KEY_BACKEND" in
+        fichier|vault-kv|vault-transit) ;;
+        *) die "KEY_BACKEND doit valoir fichier, vault-kv ou vault-transit (pas '$KEY_BACKEND')" ;;
+    esac
+    if [[ "$KEY_BACKEND" != fichier ]]; then
+        : "${VAULT_ADDR:?VAULT_ADDR manquant dans $CONFIG_FILE}"
+        : "${VAULT_TOKEN_FILE:?VAULT_TOKEN_FILE manquant dans $CONFIG_FILE}"
+        command -v curl >/dev/null || die "Commande manquante : curl"
+    fi
+    if [[ -n "${VAULT_ADDR:-}" ]]; then
+        check_secure_file "${VAULT_TOKEN_FILE:?VAULT_TOKEN_FILE manquant dans $CONFIG_FILE}"
+    fi
     if [[ -n "${TUNNEL_SSH:-}" ]]; then
         : "${TUNNEL_KEY:?TUNNEL_KEY manquant dans $CONFIG_FILE}"
         : "${TUNNEL_KNOWN_HOSTS:?TUNNEL_KNOWN_HOSTS manquant dans $CONFIG_FILE}"
@@ -117,6 +130,93 @@ decrypt() {  # decrypt <fichier_clé> <itérations> <archive>  (-> stdout)
     openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -iter "$2" -pass "file:$1" -in "$3"
 }
 
+# --- Gestion de la clé symétrique ---------------------------------------
+# KEY_BACKEND choisit d'où vient la clé et ce qui part dans le bucket
+# (toujours dans un fichier cle.key) :
+#   fichier       : clé générée par OpenSSL, envoyée telle quelle
+#   vault-kv      : clé générée par OpenSSL, rangée dans Vault (moteur KV) ;
+#                   cle.key ne contient que son emplacement dans Vault
+#   vault-transit : clé générée PAR Vault (moteur Transit) ; cle.key
+#                   contient la clé chiffrée par Vault (« enveloppe »),
+#                   illisible sans un token Vault autorisé
+
+# Le token Vault est écrit dans un fichier d'en-tête HTTP lu par curl
+# (-H @fichier) : il n'apparaît jamais dans les arguments d'une commande.
+VAULT_HEADER=""
+vault_init() {  # vault_init <dossier_de_travail>
+    [[ -n "${VAULT_ADDR:-}" ]] || return 0
+    VAULT_HEADER="$1/vault-header"
+    printf 'X-Vault-Token: %s\n' "$(tr -d '[:space:]' < "$VAULT_TOKEN_FILE")" > "$VAULT_HEADER"
+}
+
+# vault_api <GET|POST> <chemin_api>   (pour POST, le corps JSON est lu sur stdin)
+vault_api() {
+    [[ -n "$VAULT_HEADER" ]] || die "Vault n'est pas configuré (VAULT_ADDR / VAULT_TOKEN_FILE)"
+    local corps=()
+    [[ "$1" == POST ]] && corps=(-H "Content-Type: application/json" --data-binary @-)
+    curl -sS -m 15 --fail-with-body -H "@$VAULT_HEADER" -X "$1" "${corps[@]}" \
+        "${VAULT_ADDR%/}/v1/$2"
+}
+
+# make_key <clé_en_clair> <cle.key_pour_le_bucket> <nom_sauvegarde>
+make_key() {
+    local clair="$1" sortie="$2" nom="$3" rep
+    case "$KEY_BACKEND" in
+        fichier)
+            openssl rand -hex 32 | tr -d '\n' > "$clair"
+            cp "$clair" "$sortie"
+            ;;
+        vault-kv)
+            openssl rand -hex 32 | tr -d '\n' > "$clair"
+            jq -n --rawfile cle "$clair" '{data: {cle: $cle}}' \
+                | vault_api POST "$VAULT_KV_MOUNT/data/$VAULT_KV_PREFIX/$nom" >/dev/null \
+                || die "Impossible d'enregistrer la clé dans Vault ($VAULT_KV_MOUNT/$VAULT_KV_PREFIX/$nom)"
+            printf '%s/%s/%s' "$VAULT_KV_MOUNT" "$VAULT_KV_PREFIX" "$nom" > "$sortie"
+            ;;
+        vault-transit)
+            rep="$clair.reponse"
+            echo '{"bits": 256}' \
+                | vault_api POST "$VAULT_TRANSIT_MOUNT/datakey/plaintext/$VAULT_TRANSIT_KEY" > "$rep" \
+                || die "Vault n'a pas fourni de clé ($VAULT_TRANSIT_MOUNT/datakey/$VAULT_TRANSIT_KEY)"
+            jq -jer '.data.plaintext' "$rep" > "$clair" || die "Réponse de Vault invalide"
+            jq -jer '.data.ciphertext' "$rep" > "$sortie" || die "Réponse de Vault invalide"
+            rm -f "$rep"
+            ;;
+    esac
+}
+
+# fetch_key <metadata.json> <cle.key_du_bucket> <clé_en_clair>
+# Retrouve la clé en clair d'après la méthode notée dans le JSON.
+fetch_key() {
+    local json="$1" entree="$2" clair="$3" gestion chemin cle_transit
+    gestion="$(jq -r '.chiffrement.gestion_cle // "fichier"' "$json")"
+    case "$gestion" in
+        fichier)
+            # Anti-rétrogradation : si on utilise Vault, on refuse une
+            # sauvegarde qui prétend porter sa clé en clair (un attaquant
+            # pourrait en déposer une avec SA clé pour contourner Vault).
+            [[ "$KEY_BACKEND" == fichier ]] \
+                || die "Sauvegarde à clé en clair refusée alors que KEY_BACKEND=$KEY_BACKEND (substitution possible). Pour la lire volontairement : KEY_BACKEND=fichier"
+            cp "$entree" "$clair"
+            ;;
+        vault-kv)
+            chemin="$(cat "$entree")"
+            vault_api GET "${chemin%%/*}/data/${chemin#*/}" | jq -jer '.data.data.cle' > "$clair" \
+                || die "Clé introuvable dans Vault ($chemin)"
+            ;;
+        vault-transit)
+            cle_transit="$(jq -r '.chiffrement.vault_transit_cle' "$json")"
+            jq -n --rawfile c "$entree" '{ciphertext: $c}' \
+                | vault_api POST "${VAULT_TRANSIT_MOUNT:-transit}/decrypt/$cle_transit" \
+                | jq -jer '.data.plaintext' > "$clair" \
+                || die "Vault a refusé de déchiffrer la clé (token, droits ou cle.key modifié ?)"
+            ;;
+        *)
+            die "Méthode de gestion de clé inconnue dans le JSON : $gestion"
+            ;;
+    esac
+}
+
 # --- Étape 5 : validation à partir du bucket UNIQUEMENT -----------------
 # verify_backup <nom_sauvegarde> <dossier_de_travail>
 # Télécharge archive + JSON + clé depuis MinIO, puis :
@@ -144,8 +244,9 @@ verify_backup() {
         || die "Empreinte de l'archive différente de celle du JSON : archive corrompue ou modifiée"
     log "       $hash_chiffre : conforme au JSON"
 
-    log "    b) Déchiffrement avec la clé symétrique..."
-    decrypt "$dir/cle.key" "$iter" "$dir/archive.tar.gz.enc" | tar -xzpf - -C "$dir/extrait" \
+    log "    b) Déchiffrement avec la clé symétrique ($(jq -r '.chiffrement.gestion_cle // "fichier"' "$dir/metadata.json"))..."
+    fetch_key "$dir/metadata.json" "$dir/cle.key" "$dir/cle.clair"
+    decrypt "$dir/cle.clair" "$iter" "$dir/archive.tar.gz.enc" | tar -xzpf - -C "$dir/extrait" \
         || die "Déchiffrement impossible (mauvaise clé ou archive abîmée)"
 
     log "    c) Contrôle final : empreinte du dossier déchiffré..."

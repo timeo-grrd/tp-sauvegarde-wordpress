@@ -16,7 +16,7 @@
 | Étape (barème) | Implémentation |
 |---|---|
 | **1. Hash initial** (0,5) | `hash_dir` : SHA-256 de la liste triée « empreinte + chemin » de chaque fichier de `/var/www`, calculé avant toute manipulation |
-| **2. Clé + chiffrement** (1,5) | `openssl rand -hex 32` : clé de 256 bits, nouvelle à chaque sauvegarde (simule la fourniture d'un secret par Vault). `tar -cz` envoyé directement dans `openssl enc -aes-256-cbc -pbkdf2` : aucune archive en clair sur le disque, et la clé est passée par fichier, jamais en argument (sinon elle serait visible dans `ps`) |
+| **2. Clé + chiffrement** (1,5) | Clé de 256 bits, nouvelle à chaque sauvegarde, générée par OpenSSL ou **fournie par HashiCorp Vault** (voir plus bas). `tar -cz` envoyé directement dans `openssl enc -aes-256-cbc -pbkdf2` : aucune archive en clair sur le disque, et la clé est passée par fichier, jamais en argument (sinon elle serait visible dans `ps`) |
 | **3. Hash archive + JSON** (0,5) | SHA-256 de l'archive chiffrée. `metadata.json` construit avec `jq` : horodatage, chemin source, hash initial, hash de l'archive chiffrée, paramètres de chiffrement |
 | **4. Transfert vers MinIO** (1) | `rclone copy` des 3 fichiers dans `bucket/<sauvegarde>/`. Canal sécurisé : tunnel SSH optionnel (voir plus bas) |
 | **5. Validation** (1,5) | `verify_backup` : retélécharge les 3 fichiers **depuis le bucket**, compare le hash de l'archive au JSON, déchiffre avec la clé, compare le hash du dossier déchiffré au hash initial. Toute différence arrête le script avec une erreur |
@@ -63,6 +63,24 @@ backup-timeo/
   "base_de_donnees_incluse": "wordpress"
 }
 ```
+
+## Gestion de la clé et HashiCorp Vault
+
+`KEY_BACKEND` (dans `config.conf`) choisit d'où vient la clé et ce que contient `cle.key` dans le bucket :
+
+| `KEY_BACKEND` | Origine de la clé | Contenu de `cle.key` dans le bucket | Qui peut déchiffrer ? |
+|---|---|---|---|
+| `fichier` | `openssl rand -hex 32` | la clé en clair | quiconque lit le bucket |
+| `vault-kv` | `openssl rand -hex 32`, rangée dans Vault (moteur KV v2) | le chemin de la clé dans Vault | lecteur du bucket **et** détenteur d'un token Vault autorisé |
+| `vault-transit` | **générée par Vault** (`transit/datakey`) | la clé **chiffrée par Vault** (`vault:v1:…`) | lecteur du bucket **et** détenteur d'un token Vault autorisé |
+
+Le mode **`vault-transit`** est recommandé : c'est le chiffrement « en enveloppe ». La clé part bien dans le bucket, comme le demande le cahier des charges, mais sous une forme que seul Vault peut ouvrir. Une fuite du bucket ne suffit plus à lire les archives. Le JSON note la méthode utilisée, ce qui permet de relire les anciennes sauvegardes après un changement de mode. Exception volontaire : quand la config utilise Vault, une sauvegarde qui se présente avec une clé en clair est refusée. Sans ça, un attaquant capable d'écrire dans le bucket pourrait y déposer une fausse sauvegarde chiffrée avec sa propre clé et contourner Vault (attaque par rétrogradation).
+
+Le token Vault est stocké dans `/etc/wp-backup/vault-token` (root, `600`) et transmis à `curl` par un fichier d'en-tête : il n'apparaît jamais dans les arguments d'une commande (`ps`) ni dans l'historique.
+
+**Prérequis côté Vault :**
+- `vault-transit` : `vault secrets enable transit` puis `vault write -f transit/keys/wp-backup-timeo`. Le token doit pouvoir appeler `transit/datakey/plaintext/wp-backup-timeo` et `transit/decrypt/wp-backup-timeo`.
+- `vault-kv` : un moteur KV v2 monté sur `secret/`, avec le droit d'écrire et de lire dans `secret/data/wp-backup/timeo/*`.
 
 ## Installation
 
@@ -145,11 +163,18 @@ sudo tail -f /var/log/wp-backup.log           # journal du cron
 | Rotation avec `KEEP_ARCHIVES=3` | La sauvegarde la plus ancienne est supprimée |
 | Article supprimé + fichier `intrus.php` ajouté, puis restauration | Article revenu, `intrus.php` supprimé, hash final = hash initial |
 | Exécution dans l'environnement de cron | OK |
+| Modes `fichier`, `vault-kv` et `vault-transit` | Sauvegarde et validation OK pour les trois |
+| Anciennes sauvegardes `vault-kv` relues en mode `vault-transit` | OK (méthode lue dans le JSON) |
+| Sauvegarde à clé en clair (`fichier`) présentée alors que la config utilise Vault | Refusée (anti-rétrogradation) |
+| Mauvais token Vault, Vault éteint, enveloppe `cle.key` falsifiée | Refusés |
+| Restauration en mode `vault-transit` | OK |
+| Token visible dans `ps` pendant une sauvegarde | Jamais |
 | Deux exécutions simultanées / config en `644` / lancement sans root | Refusés |
 
 ## Limites connues
 
-- **La clé est stockée dans le bucket, à côté de l'archive** (exigence du cahier des charges). On privilégie la Disponibilité : la restauration reste possible même si la VM est perdue. Mais qui peut lire le bucket peut aussi déchiffrer. En production, la clé irait dans un coffre séparé (HashiCorp Vault), et seul son identifiant figurerait dans le JSON.
+- **En mode `fichier`, la clé est en clair dans le bucket**, à côté de l'archive : qui lit le bucket peut déchiffrer. Les modes `vault-kv` et `vault-transit` corrigent ce point. En contrepartie, **Vault devient indispensable pour restaurer** (Disponibilité) : s'il est perdu, ou si sa clé Transit est supprimée, les archives sont illisibles.
+- **Vault est joint en `http://`** : sans TLS, le token et les clés circulent en clair sur le réseau.
 - **Une sauvegarde entièrement falsifiée ne serait pas détectée.** Un attaquant capable d'écrire dans le bucket pourrait remplacer d'un coup l'archive, le JSON et la clé par un ensemble cohérent. La parade : signer le JSON avec un secret conservé hors du bucket (HMAC ou signature GPG).
 - **AES-CBC n'authentifie pas les données** : c'est la comparaison des hashs qui détecte les modifications.
 - **Sans tunnel, le transfert est en clair** si MinIO est en `http://`.

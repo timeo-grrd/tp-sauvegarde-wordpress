@@ -20,6 +20,7 @@ load_config
 
 WORKDIR="$(mktemp -d)"
 trap 'close_tunnel; rm -rf "$WORKDIR"' EXIT
+vault_init "$WORKDIR"
 open_tunnel
 
 NAME="${1:-}"

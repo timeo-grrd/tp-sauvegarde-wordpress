@@ -33,10 +33,11 @@ WORKDIR="$(mktemp -d)"
 trap 'close_tunnel; rm -rf "$WORKDIR"' EXIT
 OUT="$WORKDIR/envoi"          # les 3 fichiers à envoyer
 mkdir "$OUT"
-KEYFILE="$OUT/cle.key"
+KEYFILE="$WORKDIR/cle.clair"  # clé en clair : ne quitte jamais la machine
 ARCHIVE="$OUT/archive.tar.gz.enc"
 
 log "Début de la sauvegarde $NAME"
+vault_init "$WORKDIR"
 open_tunnel
 rc lsf "$S3_TARGET" --max-depth 1 >/dev/null \
     || die "Bucket $S3_TARGET inaccessible : vérifie rclone.conf, le réseau et le nom du bucket"
@@ -47,12 +48,15 @@ HASH_INITIAL="$(hash_dir "$SOURCE_DIR")"
 log "    $HASH_INITIAL"
 
 # --- 2. Clé symétrique + chiffrement -----------------------------------
-# 32 octets = 256 bits tirés par le générateur aléatoire cryptographique
-# d'OpenSSL. Simule la fourniture d'un secret par un coffre (HashiCorp
-# Vault). Une nouvelle clé par sauvegarde : une clé qui fuit n'ouvre
-# qu'une seule archive.
-log "2/5 Génération d'une clé symétrique aléatoire (256 bits)..."
-openssl rand -hex 32 | tr -d '\n' > "$KEYFILE"
+# Clé de 256 bits, nouvelle à chaque sauvegarde : une clé qui fuit
+# n'ouvre qu'une seule archive. Selon KEY_BACKEND, elle est générée par
+# OpenSSL ou fournie par HashiCorp Vault (voir make_key dans common.sh).
+case "$KEY_BACKEND" in
+    fichier)       log "2/5 Génération d'une clé symétrique aléatoire (256 bits, OpenSSL)..." ;;
+    vault-kv)      log "2/5 Génération d'une clé symétrique (256 bits) et dépôt dans Vault ($VAULT_KV_MOUNT/$VAULT_KV_PREFIX/$NAME)..." ;;
+    vault-transit) log "2/5 Clé symétrique (256 bits) fournie par Vault Transit ($VAULT_TRANSIT_KEY)..." ;;
+esac
+make_key "$KEYFILE" "$OUT/cle.key" "$NAME"
 
 TAR_EXTRA=()
 if [[ -n "${DB_NAME:-}" ]]; then
@@ -81,6 +85,8 @@ jq -n \
     --arg hash_initial "$HASH_INITIAL" \
     --arg hash_chiffre "$HASH_CHIFFRE" \
     --argjson iter "$PBKDF2_ITER" \
+    --arg gestion "$KEY_BACKEND" \
+    --arg transit "${VAULT_TRANSIT_KEY:-}" \
     --arg base "${DB_NAME:-}" \
     '{
         sauvegarde: $sauvegarde,
@@ -89,8 +95,9 @@ jq -n \
         chemin_source: $source,
         hash_initial:          { algo: "sha256", valeur: $hash_initial },
         hash_archive_chiffree: { algo: "sha256", valeur: $hash_chiffre },
-        chiffrement: { algo: "aes-256-cbc", derivation: "pbkdf2-sha256",
-                       iterations: $iter, fichier_cle: "cle.key" },
+        chiffrement: ({ algo: "aes-256-cbc", derivation: "pbkdf2-sha256",
+                        iterations: $iter, fichier_cle: "cle.key", gestion_cle: $gestion }
+                      + (if $gestion == "vault-transit" then { vault_transit_cle: $transit } else {} end)),
         base_de_donnees_incluse: $base
     }' > "$OUT/metadata.json"
 
