@@ -115,6 +115,7 @@ if (( KEEP_ARCHIVES > 0 )); then
         | grep "^wordpress_$(hostname)_" | sort -r | tail -n +"$((KEEP_ARCHIVES + 1))")
     for a in "${ANCIENNES[@]}"; do
         log "Rotation : suppression de $a"
+        delete_vault_key "$a"
         rc purge "$S3_TARGET/$a"
     done
 fi

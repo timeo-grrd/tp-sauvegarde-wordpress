@@ -229,6 +229,22 @@ fetch_key() {
     esac
 }
 
+# delete_vault_key <nom_sauvegarde>
+# Lors de la rotation : supprime de Vault la clé d'une sauvegarde en mode
+# vault-kv, pour ne pas laisser de clés orphelines dans le coffre. (En
+# vault-transit, la clé n'existe que chiffrée dans le bucket : rien à faire.)
+delete_vault_key() {
+    local nom="$1" meta chemin
+    meta="$(rc cat "$S3_TARGET/$nom/metadata.json" 2>/dev/null)" || return 0
+    [[ "$(jq -r '.chiffrement.gestion_cle // "fichier"' <<<"$meta")" == vault-kv ]] || return 0
+    chemin="$(rc cat "$S3_TARGET/$nom/cle.key" 2>/dev/null)" || return 0
+    if vault_api DELETE "${chemin%%/*}/metadata/${chemin#*/}" >/dev/null; then
+        log "    Clé supprimée de Vault ($chemin)"
+    else
+        log "    AVERTISSEMENT : clé non supprimée de Vault ($chemin)"
+    fi
+}
+
 # --- Étape 5 : validation à partir du bucket UNIQUEMENT -----------------
 # verify_backup <nom_sauvegarde> <dossier_de_travail>
 # Télécharge archive + JSON + clé depuis MinIO, puis :

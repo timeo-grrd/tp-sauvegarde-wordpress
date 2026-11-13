@@ -172,7 +172,7 @@ sudo tail -f /var/log/wp-backup.log           # journal du cron
 | Archive remplacée dans le bucket | Validation échoue (hash ≠ JSON) |
 | Archive **et** hash du JSON remplacés | Validation échoue (déchiffrement impossible) |
 | Mauvaise clé / clé absente | Validation échoue |
-| Rotation avec `KEEP_ARCHIVES=3` | La sauvegarde la plus ancienne est supprimée |
+| Rotation avec `KEEP_ARCHIVES=3` | La sauvegarde la plus ancienne est supprimée du bucket, et sa clé de Vault en mode `vault-kv` |
 | Article supprimé + fichier `intrus.php` ajouté, puis restauration | Article revenu, `intrus.php` supprimé, hash final = hash initial |
 | Exécution dans l'environnement de cron | OK |
 | Modes `fichier`, `vault-kv` et `vault-transit` | Sauvegarde et validation OK pour les trois |
