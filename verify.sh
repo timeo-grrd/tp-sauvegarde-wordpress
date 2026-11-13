@@ -25,8 +25,8 @@ open_tunnel
 
 NAME="${1:-}"
 if [[ -z "$NAME" ]]; then
-    NAME="$(rc lsf "$S3_TARGET" --dirs-only | sed 's:/$::' | grep '^wordpress_' | sort -r | head -1)" \
-        || die "Bucket inaccessible"
+    NAME="$(rc lsf "$S3_TARGET" --dirs-only | sed 's:/$::' | { grep '^wordpress_' || true; } | sort -r | head -1)" \
+        || die "Bucket $S3_TARGET inaccessible"
     [[ -n "$NAME" ]] || die "Aucune sauvegarde dans $S3_TARGET"
 fi
 

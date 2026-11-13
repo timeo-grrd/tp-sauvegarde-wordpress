@@ -18,7 +18,7 @@
 | **1. Hash initial** (0,5) | `hash_dir` : SHA-256 de la liste triée « empreinte + chemin » de chaque fichier de `/var/www`, calculé avant toute manipulation |
 | **2. Clé + chiffrement** (1,5) | Clé de 256 bits, nouvelle à chaque sauvegarde, générée par OpenSSL ou **fournie par HashiCorp Vault** (voir plus bas). `tar -cz` envoyé directement dans `openssl enc -aes-256-cbc -pbkdf2` : aucune archive en clair sur le disque, et la clé est passée par fichier, jamais en argument (sinon elle serait visible dans `ps`) |
 | **3. Hash archive + JSON** (0,5) | SHA-256 de l'archive chiffrée. `metadata.json` construit avec `jq` : horodatage, chemin source, hash initial, hash de l'archive chiffrée, paramètres de chiffrement |
-| **4. Transfert vers MinIO** (1) | `rclone copy` des 3 fichiers dans `bucket/<sauvegarde>/`. Canal sécurisé : tunnel SSH optionnel (voir plus bas) |
+| **4. Transfert vers MinIO** (1) | `rclone copy` des 3 fichiers dans `bucket/<sauvegarde>/`, à travers un rebond SSH chiffré (voir plus bas) |
 | **5. Validation** (1,5) | `verify_backup` : retélécharge les 3 fichiers **depuis le bucket**, compare le hash de l'archive au JSON, déchiffre avec la clé, compare le hash du dossier déchiffré au hash initial. Toute différence arrête le script avec une erreur |
 
 Exemple de sortie :
@@ -123,22 +123,34 @@ sudo install -m 644 wp-backup.cron /etc/cron.d/wp-backup
 
 Le cron exécute la copie de `/opt/wp-backup`, qui appartient à root, et non le dépôt dans `/home/tim` : si root exécutait un fichier modifiable par `tim`, compromettre `tim` suffirait pour devenir root. Pour la même raison, les scripts refusent une configuration qui n'appartient pas à root ou qui n'est pas en `600`. Après chaque modification, relancer les commandes `install`.
 
-## Canal sécurisé : tunnel SSH (optionnel)
+## Canal sécurisé : rebond SSH
 
-Avec un endpoint `http://`, le trafic S3 circule **en clair** sur le réseau, y compris `cle.key`. Quelqu'un qui écoute le réseau récupère alors l'archive et sa clé. Si `TUNNEL_SSH` est renseigné, le script ouvre un tunnel SSH chiffré vers le serveur de sauvegarde, y fait passer tout le trafic S3, puis le referme :
+MinIO et Vault ne sont pas joignables en direct : il faut passer par une machine de rebond (bastion) en SSH. Si `TUNNEL_SSH` est renseigné, chaque script ouvre **une** connexion SSH vers le bastion, y fait passer le trafic S3 et le trafic Vault, chiffrés, puis la referme à la fin :
 
 ```
-VM ──SSH chiffré (2223)──► serveur de sauvegarde ──► MinIO (localhost:9000)
+VM ──SSH chiffré──► bastion ──► MinIO  (TUNNEL_REMOTE,       entrée locale 127.0.0.1:19000)
+                            └─► Vault  (TUNNEL_VAULT_REMOTE, entrée locale 127.0.0.1:18200)
 ```
+
+C'est aussi ce qui répond à l'exigence de « canal sécurisé » : sans rebond, avec des adresses en `http://`, la clé et le token circuleraient en clair.
 
 ```bash
 sudo ssh-keygen -t ed25519 -N "" -f /etc/wp-backup/ssh_key -C wp-backup
-sudo ssh-copy-id -i /etc/wp-backup/ssh_key.pub -p 2223 timeo@10.1.60.10
-sudo ssh -p 2223 -i /etc/wp-backup/ssh_key -o UserKnownHostsFile=/etc/wp-backup/known_hosts timeo@10.1.60.10 exit
+sudo ssh-copy-id -i /etc/wp-backup/ssh_key.pub -p PORT UTILISATEUR@BASTION
+sudo ssh -p PORT -i /etc/wp-backup/ssh_key -o UserKnownHostsFile=/etc/wp-backup/known_hosts UTILISATEUR@BASTION exit
 sudo chmod 600 /etc/wp-backup/known_hosts
 ```
 
-Puis, dans `config.conf` : `TUNNEL_SSH="timeo@10.1.60.10"`. Le tunnel refuse un serveur dont l'empreinte n'est pas déjà dans `known_hosts` (`StrictHostKeyChecking=yes`).
+Puis, dans `config.conf` :
+
+```bash
+TUNNEL_SSH="UTILISATEUR@BASTION"
+TUNNEL_PORT="PORT"
+TUNNEL_REMOTE="10.1.60.10:9000"        # MinIO, vu depuis le bastion
+TUNNEL_VAULT_REMOTE="10.1.60.50:8200"  # Vault, vu depuis le bastion
+```
+
+Le rebond refuse un bastion dont l'empreinte n'est pas déjà dans `known_hosts` (`StrictHostKeyChecking=yes`). Les adresses `endpoint` de `rclone.conf` et `VAULT_ADDR` sont alors remplacées automatiquement par les entrées locales du tunnel.
 
 ## Utilisation
 
@@ -155,8 +167,8 @@ sudo tail -f /var/log/wp-backup.log           # journal du cron
 | Test | Résultat |
 |---|---|
 | Sauvegarde complète, connexion directe | Étapes 1 à 5 OK |
-| Sauvegarde complète via tunnel SSH, adresse directe rendue injoignable | OK : tout le trafic passe par le tunnel, fermé à la fin |
-| Serveur SSH à l'empreinte inconnue | Tunnel refusé |
+| Sauvegarde, validation et restauration via rebond SSH, MinIO et Vault rendus injoignables en direct | OK : tout passe par le tunnel, fermé à la fin |
+| Bastion à l'empreinte inconnue | Rebond refusé |
 | Archive remplacée dans le bucket | Validation échoue (hash ≠ JSON) |
 | Archive **et** hash du JSON remplacés | Validation échoue (déchiffrement impossible) |
 | Mauvaise clé / clé absente | Validation échoue |
@@ -177,7 +189,7 @@ sudo tail -f /var/log/wp-backup.log           # journal du cron
 - **Vault est joint en `http://`** : sans TLS, le token et les clés circulent en clair sur le réseau.
 - **Une sauvegarde entièrement falsifiée ne serait pas détectée.** Un attaquant capable d'écrire dans le bucket pourrait remplacer d'un coup l'archive, le JSON et la clé par un ensemble cohérent. La parade : signer le JSON avec un secret conservé hors du bucket (HMAC ou signature GPG).
 - **AES-CBC n'authentifie pas les données** : c'est la comparaison des hashs qui détecte les modifications.
-- **Sans tunnel, le transfert est en clair** si MinIO est en `http://`.
+- **Sans rebond SSH, le transfert est en clair** si MinIO et Vault sont en `http://`.
 - **Le hash du dossier** couvre le contenu et les noms des fichiers, pas les droits ni les dates.
 - **Le cron ne rattrape pas une exécution manquée** si la VM est éteinte (`anacron` le ferait), et `/var/log/wp-backup.log` est à confier à `logrotate`.
 - **Le cahier des charges cite l'outil `mc`**, dont le binaire n'est plus téléchargeable sur dl.min.io (erreur 410). `rclone` est un client S3 équivalent, disponible dans les dépôts Ubuntu.

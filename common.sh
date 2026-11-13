@@ -70,22 +70,27 @@ load_config() {
     fi
 }
 
-# --- Canal sécurisé : tunnel SSH (optionnel) ----------------------------
-# Si TUNNEL_SSH est défini, tout le trafic S3 passe dans un tunnel SSH
-# chiffré : 127.0.0.1:TUNNEL_LOCAL_PORT -> serveur SSH -> MinIO.
+# --- Canal sécurisé : rebond SSH (optionnel) ----------------------------
+# Si TUNNEL_SSH est défini, on ouvre une connexion SSH vers la machine de
+# rebond (bastion) et on y fait passer, chiffrés :
+#   127.0.0.1:TUNNEL_LOCAL_PORT       -> bastion -> MinIO (TUNNEL_REMOTE)
+#   127.0.0.1:TUNNEL_VAULT_LOCAL_PORT -> bastion -> Vault (TUNNEL_VAULT_REMOTE)
 TUNNEL_SOCK=""
 open_tunnel() {
     [[ -n "${TUNNEL_SSH:-}" ]] || return 0
+    local renvois=(-L "127.0.0.1:${TUNNEL_LOCAL_PORT:-19000}:${TUNNEL_REMOTE:-localhost:9000}")
+    if [[ -n "${TUNNEL_VAULT_REMOTE:-}" ]]; then
+        renvois+=(-L "127.0.0.1:${TUNNEL_VAULT_LOCAL_PORT:-18200}:$TUNNEL_VAULT_REMOTE")
+    fi
     TUNNEL_SOCK="$(mktemp -u /run/wp-backup-ssh.XXXXXX)"
-    log "Ouverture du tunnel SSH vers $TUNNEL_SSH (port ${TUNNEL_PORT:-22})..."
+    log "Ouverture du rebond SSH via $TUNNEL_SSH (port ${TUNNEL_PORT:-22})..."
     # StrictHostKeyChecking=yes : on refuse un serveur dont l'empreinte
     # n'est pas déjà connue (protection contre l'interception).
     ssh -f -N -M -S "$TUNNEL_SOCK" -p "${TUNNEL_PORT:-22}" -i "$TUNNEL_KEY" \
         -o BatchMode=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$TUNNEL_KNOWN_HOSTS" \
-        -L "127.0.0.1:${TUNNEL_LOCAL_PORT:-19000}:${TUNNEL_REMOTE:-localhost:9000}" \
-        "$TUNNEL_SSH" </dev/null \
-        || die "Impossible d'ouvrir le tunnel SSH vers $TUNNEL_SSH"
+        "${renvois[@]}" "$TUNNEL_SSH" </dev/null \
+        || die "Impossible d'ouvrir le rebond SSH via $TUNNEL_SSH"
 }
 close_tunnel() {
     [[ -n "$TUNNEL_SOCK" && -S "$TUNNEL_SOCK" ]] || return 0
@@ -143,8 +148,15 @@ decrypt() {  # decrypt <fichier_clé> <itérations> <archive>  (-> stdout)
 # Le token Vault est écrit dans un fichier d'en-tête HTTP lu par curl
 # (-H @fichier) : il n'apparaît jamais dans les arguments d'une commande.
 VAULT_HEADER=""
+VAULT_URL=""
 vault_init() {  # vault_init <dossier_de_travail>
     [[ -n "${VAULT_ADDR:-}" ]] || return 0
+    # Avec le rebond SSH, Vault est joint par l'entrée locale du tunnel
+    if [[ -n "${TUNNEL_SSH:-}" && -n "${TUNNEL_VAULT_REMOTE:-}" ]]; then
+        VAULT_URL="http://127.0.0.1:${TUNNEL_VAULT_LOCAL_PORT:-18200}"
+    else
+        VAULT_URL="${VAULT_ADDR%/}"
+    fi
     VAULT_HEADER="$1/vault-header"
     printf 'X-Vault-Token: %s\n' "$(tr -d '[:space:]' < "$VAULT_TOKEN_FILE")" > "$VAULT_HEADER"
 }
@@ -155,7 +167,7 @@ vault_api() {
     local corps=()
     [[ "$1" == POST ]] && corps=(-H "Content-Type: application/json" --data-binary @-)
     curl -sS -m 15 --fail-with-body -H "@$VAULT_HEADER" -X "$1" "${corps[@]}" \
-        "${VAULT_ADDR%/}/v1/$2"
+        "$VAULT_URL/v1/$2"
 }
 
 # make_key <clé_en_clair> <cle.key_pour_le_bucket> <nom_sauvegarde>
