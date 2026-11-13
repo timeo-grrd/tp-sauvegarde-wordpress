@@ -1,7 +1,13 @@
-# Config locale : IP, utilisateur, chemin de clé -> jamais sur GitHub
+# Configs locales (identifiants MinIO, clé SSH) : jamais sur GitHub
 config.conf
+rclone.conf
+known_hosts
+ssh_key*
 
-# Archives et logs
+# Clés de chiffrement, métadonnées, archives, logs
+*.key
+*.json
+*.enc
 *.tar.gz
 *.sql
 *.log
